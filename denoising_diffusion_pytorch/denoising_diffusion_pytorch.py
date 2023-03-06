@@ -130,12 +130,15 @@ def Downsample(dim, dim_out = None):
 
 class WeightStandardizedConv2d(nn.Conv2d):
     """
+    每次计算之前都要规整化参数。
     https://arxiv.org/abs/1903.10520
     weight standardization purportedly works synergistically with group normalization
     """
     def forward(self, x):
         eps = 1e-5 if x.dtype == torch.float32 else 1e-3
 
+        # Conv2d权重张量形状：（Cout, Cin/Grps, Kernel0, Kernel1)
+        # 每个输出通道对应的参数规整化为均值0,方差为1
         weight = self.weight
         mean = reduce(weight, 'o ... -> o 1 1 1', 'mean')
         var = reduce(weight, 'o ... -> o 1 1 1', partial(torch.var, unbiased = False))
@@ -144,8 +147,14 @@ class WeightStandardizedConv2d(nn.Conv2d):
         return F.conv2d(x, normalized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 class LayerNorm(nn.Module):
+    """ 
+    一层的输出做规整。如果x是(batch, channel, height, width), 则是在同一位置的各个channel的信号强度
+    被规整化为均值0方差1的。
+    self.g是每个channel一个值。学习g的意义是调整不同channel的信号强度？
+    """
     def __init__(self, dim):
         super().__init__()
+        # 参数不同于权重
         self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
 
     def forward(self, x):
@@ -154,7 +163,9 @@ class LayerNorm(nn.Module):
         mean = torch.mean(x, dim = 1, keepdim = True)
         return (x - mean) * (var + eps).rsqrt() * self.g
 
+
 class PreNorm(nn.Module):
+    """PreNorm是将LayerNorm和下一层组了块儿。应该是便于后续复杂模型的组装。"""
     def __init__(self, dim, fn):
         super().__init__()
         self.fn = fn
@@ -167,15 +178,23 @@ class PreNorm(nn.Module):
 # sinusoidal positional embeds
 
 class SinusoidalPosEmb(nn.Module):
+    """ 
+    位置k编码为长度为d的向量
+    p(k,d,2i) = sin(k/10000^{2i/d}) = sin(k * exp(2*i/d * log(10000)))
+    =sin(k * exp(log(10000) / (d/2) * i))
+    p(k,d,2i+1) = cos(k/10000^{2i/d})
+    =cos(k * exp(log(10000) / (d/2) * i))
+    """
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
 
+    
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = math.log(10000) / (half_dim - 1) # emb 约等于 logN/N
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb) # 最大的N 
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
