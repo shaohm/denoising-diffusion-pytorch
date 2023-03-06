@@ -2,31 +2,53 @@ import math
 import copy
 from pathlib import Path
 from random import random
-from functools import partial
+from functools import partial # 函数修饰器，可以设置默认参数。
 from collections import namedtuple
 from multiprocessing import cpu_count
 
 import torch
-from torch import nn, einsum
-import torch.nn.functional as F
+#1D: i->;  i,i->i; i,i->; i,j->i,j;
+#2D: ii; ij,ji->ij; ij,jk->ik; ij,kl->ijkl
+from torch import nn, einsum # 快速的积和：i,ij->i
+import torch.nn.functional as F # functional api
 from torch.utils.data import Dataset, DataLoader
 
 from torch.optim import Adam
 
-from torchvision import transforms as T, utils
+# 流行的数据集、模型架构、图像变换操作 
+# transform主要是图像的变换操作
+from torchvision import transforms as T, utils 
 
+""" 直观的张量计算
+# rearrange elements according to the pattern
+output_tensor = rearrange(input_tensor, 't b c -> b c t')
+# combine rearrangement and reduction
+output_tensor = reduce(input_tensor, 'b c (h h2) (w w2) -> b h w c', 'mean', h2=2, w2=2)
+# copy along a new axis
+output_tensor = repeat(input_tensor, 'h w -> h w c', c=3)
+"""
 from einops import rearrange, reduce
 from einops.layers.torch import Rearrange
 
+""" pillow 是python的图像处理库。
+可以读写、缩略、剪切、拼装、通道拆分合并、几何变换、颜色变换。
+还可做图像增强、动图处理、PostScript打印。
+"""
 from PIL import Image
-from tqdm.auto import tqdm
-from ema_pytorch import EMA
 
+
+from tqdm.auto import tqdm # 进度条
+
+"""训练过程中保留历史模型的指数平滑版本。作者自己写的lib。"""
+from ema_pytorch import EMA 
+
+"""pytorch加速器。可以封装计算硬件, 做到自主优化调度, 无需指定计算位置。"""
 from accelerate import Accelerator
 
 from pytorch_fid.inception import InceptionV3
 from pytorch_fid.fid_score import calculate_frechet_distance
 
+# 模型保存时记录软件版本
 from denoising_diffusion_pytorch.version import __version__
 
 # constants
@@ -51,9 +73,13 @@ def cycle(dl):
         for data in dl:
             yield data
 
+# 采样图像阵列使用，n*n，傻么？ 为何不直接用n
 def has_int_squareroot(num):
+    #TODO a bug here, should be int(math.sqrt(num))**2==num
     return (math.sqrt(num) ** 2) == num
 
+
+# 将dataset分成batches，最后一个batch可能偏小
 def num_to_groups(num, divisor):
     groups = num // divisor
     remainder = num % divisor
@@ -62,21 +88,23 @@ def num_to_groups(num, divisor):
         arr.append(remainder)
     return arr
 
+# 图像类型变换
 def convert_image_to_fn(img_type, image):
     if image.mode != img_type:
         return image.convert(img_type)
     return image
 
 # normalization functions
-
+# 正则化为-1到1之间
 def normalize_to_neg_one_to_one(img):
     return img * 2 - 1
 
+# 回到0-1之间
 def unnormalize_to_zero_to_one(t):
     return (t + 1) * 0.5
 
 # small helper modules
-
+""" 残差模块 y = f(x) + x"""
 class Residual(nn.Module):
     def __init__(self, fn):
         super().__init__()
@@ -85,12 +113,15 @@ class Residual(nn.Module):
     def forward(self, x, *args, **kwargs):
         return self.fn(x, *args, **kwargs) + x
 
+# 升采样。先将一个点扩成四个点。再走一边卷积。
 def Upsample(dim, dim_out = None):
     return nn.Sequential(
+        # (batch, channel, height * s, width * s)
         nn.Upsample(scale_factor = 2, mode = 'nearest'),
         nn.Conv2d(dim, default(dim_out, dim), 3, padding = 1)
     )
 
+# 降采样。把图像的四个像素，变成一个像素的四个通道。
 def Downsample(dim, dim_out = None):
     return nn.Sequential(
         Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
@@ -764,6 +795,7 @@ class GaussianDiffusion(nn.Module):
 
 # dataset classes
 
+""" 读取和预处理数据集。可以变换图像类型、调整大小、增广数据集、中心切割，最后输出张量。"""
 class Dataset(Dataset):
     def __init__(
         self,
