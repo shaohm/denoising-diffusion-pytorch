@@ -130,7 +130,7 @@ def Downsample(dim, dim_out = None):
 
 class WeightStandardizedConv2d(nn.Conv2d):
     """
-    每次计算之前都要规整化参数。
+    每次计算之前, 把权重矩阵规整规整, 再做计算. 注意权重参数本身不便, 只是使用上的变化.
     https://arxiv.org/abs/1903.10520
     weight standardization purportedly works synergistically with group normalization
     """
@@ -154,7 +154,7 @@ class LayerNorm(nn.Module):
     """
     def __init__(self, dim):
         super().__init__()
-        # 参数不同于权重
+        # g是可学习的参数
         self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
 
     def forward(self, x):
@@ -165,7 +165,7 @@ class LayerNorm(nn.Module):
 
 
 class PreNorm(nn.Module):
-    """PreNorm是将LayerNorm和下一层组了块儿。应该是便于后续复杂模型的组装。"""
+    """PreNorm先对输入做LayerNorm, 再做变换。应该是便于后续复杂模型的组装。"""
     def __init__(self, dim, fn):
         super().__init__()
         self.fn = fn
@@ -179,7 +179,7 @@ class PreNorm(nn.Module):
 
 class SinusoidalPosEmb(nn.Module):
     """ 
-    位置k编码为长度为d的向量
+    位置k编码为长度为d的向量。No learning。
     p(k,d,2i) = sin(k/10000^{2i/d}) = sin(k * exp(2*i/d * log(10000)))
     =sin(k * exp(log(10000) / (d/2) * i))
     p(k,d,2i+1) = cos(k/10000^{2i/d})
@@ -202,7 +202,11 @@ class SinusoidalPosEmb(nn.Module):
 class RandomOrLearnedSinusoidalPosEmb(nn.Module):
     """ following @crowsonkb 's lead with random (learned optional) sinusoidal pos emb """
     """ https://github.com/crowsonkb/v-diffusion-jax/blob/master/diffusion/models/danbooru_128.py#L8 """
-
+    """
+    学习参数向量w. 一个位置k被映射为向量k*w, 再进一步波化.
+    p(k,d,2i) = sin(k * w * 2 * pi)
+    p(k,d,2i) = cos(k * w * 2 * pi)
+    """
     def __init__(self, dim, is_random = False):
         super().__init__()
         assert (dim % 2) == 0
@@ -219,10 +223,21 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
 # building block modules
 
 class Block(nn.Module):
+    """ 
+    就看成是一个加了激活函数的卷积层. 只是卷积后做了规整化. 
+    silu(a * gnorm(wsconv2d(x)) + b)
+    a和b
+    """
     def __init__(self, dim, dim_out, groups = 8):
         super().__init__()
         self.proj = WeightStandardizedConv2d(dim, dim_out, 3, padding = 1)
+        # BatchNorm: S_i = {k | k_C = i_C} 通道内的所有图像和所有位置
+        # LayerNorm: S_i = {k | k_N = i_N} 图像内的所有通道和所有位置
+        # InstanceNorm: S_i = {k| k_N=i_N, k_C=i_C} 图像该通道内的所有位置
+        # GroupNorm: S_i = {k| k_N=i_N, floor[k_C/(C/G)]=floor[i_C/(C/G)]} 图像该通道组内所有位置
+        # GroupNorm内有可学习的参数, 对应规整化后每个channel上的放射变换
         self.norm = nn.GroupNorm(groups, dim_out)
+        # silu(x) = x * sigmoid(x)
         self.act = nn.SiLU()
 
     def forward(self, x, scale_shift = None):
@@ -237,7 +252,17 @@ class Block(nn.Module):
         return x
 
 class ResnetBlock(nn.Module):
+    """
+    两层卷积. x+g(f(x))
+    如果x和g(f(x)) channel数不一致, 用额外的一个卷积层辅助 h(x)+g(f(x))
+
+    time_emb 若有,会先对x做一个变换. 在每个图像的每个通道内,给所有位置做一个统一的放射变换.
+    放射变换来自time_emb, 经由可学习的mlp转换得到.
+    """
     def __init__(self, dim, dim_out, *, time_emb_dim = None, groups = 8):
+        """
+        time_emb
+        """
         super().__init__()
         self.mlp = nn.Sequential(
             nn.SiLU(),
@@ -263,6 +288,17 @@ class ResnetBlock(nn.Module):
         return h + self.res_conv(x)
 
 class LinearAttention(nn.Module):
+    """ 
+    线性注意力. 将sigmoid(QK)*V, 改为sigmoid(Q)*(sigmoid(K)*V). 可以显著降低注意力机制的计算复杂性.
+    从2*Np*Np*Nk, 变为2*Np*Nk*Nk, 在图像类Np远大于Nk时, 性能提升明显.
+    Efficient Attention: Attention with Linear Complexities https://arxiv.org/pdf/1812.01243.pdf
+
+    
+    给每个图像的每个channel, 计算其Query/Key/Value向量.
+    计算加速. 先用Conv2D(inDim, heads*dim_heads,1)求得QKV的所有头的所有维度, 再拆分后分别处理.
+    搞清楚此处的隐喻? TODO
+     
+    """
     def __init__(self, dim, heads = 4, dim_head = 32):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -277,18 +313,33 @@ class LinearAttention(nn.Module):
 
     def forward(self, x):
         b, c, h, w = x.shape
+        # 一次卷积生成了三个矩阵. 拆分.
         qkv = self.to_qkv(x).chunk(3, dim = 1)
+        # 调整布局, 拆分头维度, 之后都形如(image, head, channel, position)
         q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads), qkv)
 
+        # 对每个位置的query向量做规整化, 表示对key的选择
         q = q.softmax(dim = -2)
+        # 对key每个分向量,做规整化, 表示对位置的选择
         k = k.softmax(dim = -1)
 
-        q = q * self.scale
+        # q 以1/(hdim**0.5)的比例缩放, 这个缩放意义何在? TODO
+        # 原文是为了防止softmax的输入QK值太大导致梯度太小, Linear Attention没有这个必要 TODO 清除
+        # q = q * self.scale
+
+        # v 以图像大小缩放
         v = v / (h * w)
 
+        # T(K)*V  =>  k*T(v), 由于k\q\v都是(m,n)型,论文里都是(n,m)
+        # 形成(batch, head, key_channel, value_channel), 每个key分量,有一个value向量
+        # 由于前面的缩放,每个值的范围未发生变化, 同输入一致
         context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
 
+        # 形成(batch, head, value_channel, position)
+        # Q * (T(K)*V)  =>  k*T(v)*q
         out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
+        
+        # 头的作用类似卷积中的分组, 显著降低参数量和计算量. 至1/h**2.
         out = rearrange(out, 'b h c (x y) -> b (h c) x y', h = self.heads, x = h, y = w)
         return self.to_out(out)
 

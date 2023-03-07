@@ -13,3 +13,12 @@ def pos_vector(k, d):
 d = 10
 for k in range(20):
     print(pos_vector(k,d))
+
+for k in range(20):
+    print(k, end=" ")
+    for l in range(15):
+        kv = pos_vector(k,d)
+        lv = pos_vector(l,d)
+        distance = sum([float(kx)*float(lx) for kx,lx in zip(kv,lv)])
+        print(f"{l}={distance:.2f}", end=" ")
+    print()
