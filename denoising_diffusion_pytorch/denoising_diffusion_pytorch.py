@@ -60,6 +60,7 @@ ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 def exists(x):
     return x is not None
 
+# 这个好. d若是callable, 还可以按需生成, 不浪费.
 def default(val, d):
     if exists(val):
         return val
@@ -104,25 +105,27 @@ def unnormalize_to_zero_to_one(t):
     return (t + 1) * 0.5
 
 # small helper modules
-""" 残差模块 y = f(x) + x"""
+
 class Residual(nn.Module):
     def __init__(self, fn):
+        """ 残差模块 y = f(x) + x"""
         super().__init__()
         self.fn = fn
 
     def forward(self, x, *args, **kwargs):
         return self.fn(x, *args, **kwargs) + x
 
-# 升采样。先将一个点扩成四个点。再走一边卷积。
+
 def Upsample(dim, dim_out = None):
+    """升采样。先将一个点扩成四个点。再走一边卷积。"""
     return nn.Sequential(
         # (batch, channel, height * s, width * s)
         nn.Upsample(scale_factor = 2, mode = 'nearest'),
         nn.Conv2d(dim, default(dim_out, dim), 3, padding = 1)
     )
 
-# 降采样。把图像的四个像素，变成一个像素的四个通道。
 def Downsample(dim, dim_out = None):
+    """ 降采样。把图像的四个像素, 变成一个像素的四个通道。再卷积出dim_out的通道数."""
     return nn.Sequential(
         Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
         nn.Conv2d(dim * 4, default(dim_out, dim), 1)
@@ -165,8 +168,8 @@ class LayerNorm(nn.Module):
 
 
 class PreNorm(nn.Module):
-    """PreNorm先对输入做LayerNorm, 再做变换。应该是便于后续复杂模型的组装。"""
     def __init__(self, dim, fn):
+        """PreNorm先对输入做LayerNorm, 再做变换。应该是便于后续复杂模型的组装。"""
         super().__init__()
         self.fn = fn
         self.norm = LayerNorm(dim)
@@ -206,8 +209,10 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
     学习参数向量w. 一个位置k被映射为向量k*w, 再进一步波化.
     p(k,d,2i) = sin(k * w * 2 * pi)
     p(k,d,2i) = cos(k * w * 2 * pi)
+
     """
     def __init__(self, dim, is_random = False):
+        "选定了is_random, 则参数向量不更新. "
         super().__init__()
         assert (dim % 2) == 0
         half_dim = dim // 2
@@ -252,16 +257,14 @@ class Block(nn.Module):
         return x
 
 class ResnetBlock(nn.Module):
-    """
-    两层卷积. x+g(f(x))
-    如果x和g(f(x)) channel数不一致, 用额外的一个卷积层辅助 h(x)+g(f(x))
 
-    time_emb 若有,会先对x做一个变换. 在每个图像的每个通道内,给所有位置做一个统一的放射变换.
-    放射变换来自time_emb, 经由可学习的mlp转换得到.
-    """
     def __init__(self, dim, dim_out, *, time_emb_dim = None, groups = 8):
         """
-        time_emb
+        两层卷积. x+g(f(x))
+        如果x和g(f(x)) channel数不一致, 用额外的一个卷积层辅助 h(x)+g(f(x))
+
+        time_emb 若有,会先对x做一个变换. 在每个图像的每个通道内,给所有位置做一个统一的放射变换.
+        放射变换来自time_emb, 经由可学习的mlp转换得到.
         """
         super().__init__()
         self.mlp = nn.Sequential(
@@ -336,14 +339,16 @@ class LinearAttention(nn.Module):
         context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
 
         # 形成(batch, head, value_channel, position)
-        # Q * (T(K)*V)  =>  k*T(v)*q
+        # Q * (T(K)*V)  gives (n,m) =>  k*T(v)*q gives (m, n) 
         out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
         
         # 头的作用类似卷积中的分组, 显著降低参数量和计算量. 至1/h**2.
+        # 输出仍是(batch_size, channel_num, height, width)
         out = rearrange(out, 'b h c (x y) -> b (h c) x y', h = self.heads, x = h, y = w)
         return self.to_out(out)
 
 class Attention(nn.Module):
+    """ 有了LinearAttention, 为何此处还要Attention? TODO"""
     def __init__(self, dim, heads = 4, dim_head = 32):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -372,7 +377,7 @@ class Attention(nn.Module):
 class Unet(nn.Module):
     def __init__(
         self,
-        dim,
+        dim, #64
         init_dim = None,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
@@ -384,26 +389,36 @@ class Unet(nn.Module):
         random_fourier_features = False,
         learned_sinusoidal_dim = 16
     ):
+        """
+        
+        """
         super().__init__()
 
         # determine dimensions
 
         self.channels = channels
+        # self-conditioning 是指在预估新的x_0,或者新的e,或者新的score时,参考上一步的结果. 
+        # 做法上是将上一步的结果直接拼到x_t里, 但是写明no backpropagation.
         self.self_condition = self_condition
         input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding = 3)
 
-        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        #[64, 64, 128, 256, 512]
+        dims = [init_dim, *map(lambda m: dim * m, dim_mults)] 
+        #[(64,64), (64,128), (128,256), (256,512)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
+        # 默认groups=8, 降低参数数量
         block_klass = partial(ResnetBlock, groups = resnet_block_groups)
 
         # time embeddings
-
+        # 时嵌向量 维度256
         time_dim = dim * 4
 
+        # 为什么叫fourier feature
+        # 先生成16维的正弦方嵌向量, 再用两层mlp生成256维度的时嵌向量
         self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
 
         if self.random_or_learned_sinusoidal_cond:
@@ -422,22 +437,29 @@ class Unet(nn.Module):
 
         # layers
 
+
+        # ModuleList说可以处理注册事宜, 注册都干啥? TODO
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
-        num_resolutions = len(in_out)
 
         for ind, (dim_in, dim_out) in enumerate(in_out):
-            is_last = ind >= (num_resolutions - 1)
+            is_last = ind == (len(in_out) - 1)
 
             self.downs.append(nn.ModuleList([
+                # x = x+g(f(x))
                 block_klass(dim_in, dim_in, time_emb_dim = time_dim),
+                # x = x+g(f(x))
                 block_klass(dim_in, dim_in, time_emb_dim = time_dim),
+                # x + linear_attention(layer_norm(x))
+                # 自注意机制, 发现全局模式
                 Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                # 将图像变小,通道数变多. d
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding = 1)
             ]))
 
-        mid_dim = dims[-1]
+        mid_dim = dims[-1] # 512
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+        # 此处用了Attention,而非LinearAttention,或许是因为位置数足够小,反而原来的版本更有效
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
 
@@ -459,6 +481,7 @@ class Unet(nn.Module):
 
     def forward(self, x, time, x_self_cond = None):
         if self.self_condition:
+            ## lambda 按需生成不浪费
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
 
@@ -501,6 +524,12 @@ class Unet(nn.Module):
 # gaussian diffusion trainer class
 
 def extract(a, t, x_shape):
+    """
+    从a中提取数据. t是selector. 
+    只是在最后一维挑选. out[i][j][k] = a[i][j][ t[i][j][k] ].
+    out和t的shape相同.
+    变形为 和 x_shape兼容.
+    """
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
@@ -518,6 +547,7 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     """
     cosine schedule
     as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
+    Improved Denoising Diffusion Probabilistic 
     """
     steps = timesteps + 1
     t = torch.linspace(0, timesteps, steps, dtype = torch.float64) / timesteps
@@ -531,6 +561,8 @@ def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1
     sigmoid schedule
     proposed in https://arxiv.org/abs/2212.11972 - Figure 8
     better for images > 64x64, when used during training
+    Scalable Adaptive Computation for Iterative Generation
+    RIN - Recurrent Interface Network
     """
     steps = timesteps + 1
     t = torch.linspace(0, timesteps, steps, dtype = torch.float64) / timesteps
@@ -553,12 +585,14 @@ class GaussianDiffusion(nn.Module):
         objective = 'pred_noise',
         beta_schedule = 'sigmoid',
         schedule_fn_kwargs = dict(),
-        p2_loss_weight_gamma = 0., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
+        # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
+        p2_loss_weight_gamma = 0., 
         p2_loss_weight_k = 1,
         ddim_sampling_eta = 0.,
         auto_normalize = True
     ):
         super().__init__()
+        # 不学习方差. 使用固定的正弦方嵌方案.
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
         assert not model.random_or_learned_sinusoidal_cond
 
@@ -571,7 +605,11 @@ class GaussianDiffusion(nn.Module):
 
         self.objective = objective
 
-        assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
+        assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, \
+            'objective must be either pred_noise (predict noise) or ' \
+            'pred_x0 (predict image start) or ' \
+            'pred_v (predict v [v-parameterization as defined in appendix D of '\
+            'progressive distillation paper, used in imagen-video successfully])'
 
         if beta_schedule == 'linear':
             beta_schedule_fn = linear_beta_schedule
@@ -594,7 +632,8 @@ class GaussianDiffusion(nn.Module):
 
         # sampling related parameters
 
-        self.sampling_timesteps = default(sampling_timesteps, timesteps) # default num sampling timesteps to number of timesteps at training
+        # default num sampling timesteps to number of timesteps at training
+        self.sampling_timesteps = default(sampling_timesteps, timesteps) 
 
         assert self.sampling_timesteps <= timesteps
         self.is_ddim_sampling = self.sampling_timesteps < timesteps
