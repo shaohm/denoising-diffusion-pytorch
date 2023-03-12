@@ -53,6 +53,7 @@ from denoising_diffusion_pytorch.version import __version__
 
 # constants
 
+#同时返回预测的噪声e和原始图像x_0
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 # helpers functions
@@ -70,6 +71,7 @@ def identity(t, *args, **kwargs):
     return t
 
 def cycle(dl):
+    """循环遍历dl, 没有终结."""
     while True:
         for data in dl:
             yield data
@@ -537,20 +539,28 @@ def extract(a, t, x_shape):
 def linear_beta_schedule(timesteps):
     """
     linear schedule, proposed in original ddpm paper
+    [0.0001, 0.00012, 0.00014, ..., 0.0199]
     """
-    scale = 1000 / timesteps
+    scale = 1000 / timesteps # 1.0
     beta_start = scale * 0.0001
     beta_end = scale * 0.02
     return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
 
 def cosine_beta_schedule(timesteps, s = 0.008):
     """
+    中间e-2多, 两头e-4和e-1少。 起步小e-4. 
     cosine schedule
     as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
-    Improved Denoising Diffusion Probabilistic 
+    Improved Denoising Diffusion Probabilistic
+    [] 
     """
     steps = timesteps + 1
+    #[0, 0.001, 0.002, ..., 1]
     t = torch.linspace(0, timesteps, steps, dtype = torch.float64) / timesteps
+    #[0.008/1.008, 0.009/1.008, 0.010/1.008, ..., 1.008/1.008] * 0.5 pi
+    # 
+    #[0.999, 0.998, ..., 0.01, 0.0], 前快后慢
+    #[0.998, 0.997, ..., 0.0001, 0.0]， 加速衰减
     alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
@@ -558,6 +568,7 @@ def cosine_beta_schedule(timesteps, s = 0.008):
 
 def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1e-5):
     """
+    中间e-2多, 两头e-4和e-1少。 起步大e-3. 
     sigmoid schedule
     proposed in https://arxiv.org/abs/2212.11972 - Figure 8
     better for images > 64x64, when used during training
@@ -585,7 +596,8 @@ class GaussianDiffusion(nn.Module):
         objective = 'pred_noise',
         beta_schedule = 'sigmoid',
         schedule_fn_kwargs = dict(),
-        # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
+        # p2 loss weight, from https://arxiv.org/abs/2204.00227 
+        # - 0 is equivalent to weight of 1 across time - 1. is recommended
         p2_loss_weight_gamma = 0., 
         p2_loss_weight_k = 1,
         ddim_sampling_eta = 0.,
@@ -605,12 +617,15 @@ class GaussianDiffusion(nn.Module):
 
         self.objective = objective
 
+        # Progressive Distillation for Fast Sampling of Diffusion Models
+        # 蒸馏提取, 四步就可以完成采样. 质量几乎无损.
         assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, \
             'objective must be either pred_noise (predict noise) or ' \
             'pred_x0 (predict image start) or ' \
             'pred_v (predict v [v-parameterization as defined in appendix D of '\
             'progressive distillation paper, used in imagen-video successfully])'
 
+        # 初始化beta & alpha
         if beta_schedule == 'linear':
             beta_schedule_fn = linear_beta_schedule
         elif beta_schedule == 'cosine':
@@ -620,10 +635,12 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown beta schedule {beta_schedule}')
 
+
         betas = beta_schedule_fn(timesteps, **schedule_fn_kwargs)
 
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
+        # pad 在最后一维的前侧都添加一个1.0
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
 
         timesteps, = betas.shape
@@ -634,6 +651,12 @@ class GaussianDiffusion(nn.Module):
 
         # default num sampling timesteps to number of timesteps at training
         self.sampling_timesteps = default(sampling_timesteps, timesteps) 
+
+
+        # Denoising Diffusion Implicit Models
+        # 非马尔科夫的扩散过程. DDIM采样更高效  是DDPM的几十倍
+        # DDPM的采样过程和扩散过程长度相同.
+        # DDIM可以跳步采样. 
 
         assert self.sampling_timesteps <= timesteps
         self.is_ddim_sampling = self.sampling_timesteps < timesteps
@@ -670,6 +693,9 @@ class GaussianDiffusion(nn.Module):
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
         # calculate p2 reweighting
+        # \lambda_t^' = \lambda_t / (k + SNR(t))^\gamma
+        # \gamma = 1, k = 1 is recommended 
+        # which lead to only (1-alpha_cumprod) is tp be muliplied to \lambda_t
 
         register_buffer('p2_loss_weight', (p2_loss_weight_k + alphas_cumprod / (1 - alphas_cumprod)) ** -p2_loss_weight_gamma)
 
@@ -678,18 +704,23 @@ class GaussianDiffusion(nn.Module):
         self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
         self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
 
+    # x_t = a^0.5*x_0 + (1-a)^0.5*e 
+    # x_0 = x_t * (1/a)^0.5  -  e * [(1-a)/a]^0.5
     def predict_start_from_noise(self, x_t, t, noise):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
+    # e = (x_t - x_0 * a^0.5) / (1-a)^0.5
     def predict_noise_from_start(self, x_t, t, x0):
         return (
             (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
 
+    # TODO 未知
+    # a^0.5 * e - (1-a)^0.5 * x_0
     def predict_v(self, x_start, t, noise):
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
@@ -702,6 +733,7 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
         )
 
+    # q(x_{t-1} | x_0, x_t)
     def q_posterior(self, x_start, x_t, t):
         posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
@@ -712,6 +744,8 @@ class GaussianDiffusion(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False):
+        """ 使用e_\theta(x_t, t)预测e, 然后恢复出x_0, 返回iu(e,x_0)"""
+        # e_\theta
         model_output = self.model(x, t, x_self_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
@@ -734,6 +768,10 @@ class GaussianDiffusion(nn.Module):
         return ModelPrediction(pred_noise, x_start)
 
     def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
+        """ 
+        先预测出来x_0, 根据x_0和x_t计算x_{t-1}的分布
+        这是恢复过程的步骤. 依次恢复x_{t-1}, x_{t-2}, ... 
+        """
         preds = self.model_predictions(x, t, x_self_cond)
         x_start = preds.pred_x_start
 
@@ -745,6 +783,9 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def p_sample(self, x, t: int, x_self_cond = None):
+        """ 
+        单步采样. 加noise.  
+        """
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
@@ -754,6 +795,9 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def p_sample_loop(self, shape, return_all_timesteps = False):
+        """
+        批量采样. 加noise.
+        """
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device = device)
@@ -766,6 +810,7 @@ class GaussianDiffusion(nn.Module):
             img, x_start = self.p_sample(img, t, self_cond)
             imgs.append(img)
 
+        # 看是返回最终结果, 还是每一步的结果都要
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
 
         ret = self.unnormalize(ret)
@@ -773,6 +818,9 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def ddim_sample(self, shape, return_all_timesteps = False):
+        """
+        eta默认为0, sigma也就是0, 就是确定性的采样.
+        """
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -815,12 +863,14 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def sample(self, batch_size = 16, return_all_timesteps = False):
+        """ 只是确定用哪种采样方法 """
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, image_size, image_size), return_all_timesteps = return_all_timesteps)
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
+        """ 从两个原图分别计算各自的加噪图像x_t, 然后在两个加噪图像的线性插值点上, 做图像还原. """
         b, *_, device = *x1.shape, x1.device
         t = default(t, self.num_timesteps - 1)
 
@@ -857,6 +907,7 @@ class GaussianDiffusion(nn.Module):
             raise ValueError(f'invalid loss type {self.loss_type}')
 
     def p_losses(self, x_start, t, noise = None):
+        """ 生成噪音, 叠加x_start生成x_t. 让ann从x_t估计噪音. 形成loss."""
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -897,6 +948,7 @@ class GaussianDiffusion(nn.Module):
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        # 随机生成t序列, [0, T]之间.
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         img = self.normalize(img)
@@ -1026,7 +1078,7 @@ class Trainer(object):
         self.step = 0
 
         # prepare model, dataloader, optimizer with accelerator
-
+        # 分发数据, 做好分布式计算的准备
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
     @property
@@ -1034,11 +1086,14 @@ class Trainer(object):
         return self.accelerator.device
 
     def save(self, milestone):
+        
         if not self.accelerator.is_local_main_process:
+            # 只有主进程需要做
             return
 
         data = {
             'step': self.step,
+            ## 已经交给accelerator的, 需要用accelerator的接口获取
             'model': self.accelerator.get_state_dict(self.model),
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
@@ -1090,12 +1145,15 @@ class Trainer(object):
         accelerator = self.accelerator
         device = accelerator.device
 
+        # disable 是不是主进程不打印? 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
 
+                # 几个批次的平均损失, 汇报用.目前是2个批次,有点小.
                 total_loss = 0.
-
+                # 在叶子(参数)上积累梯度, 积累几步走一步
+                # 手工的步数操作, 没用Accelerator的accumulate机制
                 for _ in range(self.gradient_accumulate_every):
                     data = next(self.dl).to(device)
 
@@ -1104,11 +1162,22 @@ class Trainer(object):
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
+                    #  在叶子上积累梯度
                     self.accelerator.backward(loss)
 
+                # 将梯度规范化为norm为1.0, 是否太小了? 
+                # 如果一百万个参数, 每个参数的幅度只有0.001, 如果1亿个参数,每个参数的幅度只有0.0001
+                # 是否因此才需要训练几百万步?
+                # 如果改成10, 1亿个参数, 步幅0.0003, 可提升3倍
+                # 似乎并不明显, 到底是多少也没打印出来看看 TODO
+                # 似乎也只有1左右
+                # 毕竟32 * 32 * 3 * (0.3 ** 2) 也就是3
+                # 可能在更大的图像时,会有用处
                 accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+
                 pbar.set_description(f'loss: {total_loss:.4f}')
 
+                
                 accelerator.wait_for_everyone()
 
                 self.opt.step()
